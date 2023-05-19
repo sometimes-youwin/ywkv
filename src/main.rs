@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     net::{SocketAddr, SocketAddrV4},
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -14,98 +13,43 @@ use axum::{
     Json, Router,
 };
 use clap::{Arg, ArgAction};
-use redb::{Database, ReadableTable, TableDefinition};
-use serde::Serialize;
+use redb::{Database, TableDefinition};
 use tokio::sync::RwLock;
 use tower_http::{compression::CompressionLayer, validate_request::ValidateRequestHeaderLayer};
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum Status {
-    Read(ReadStatus),
-    Write(WriteStatus),
-}
-
-#[derive(Serialize)]
-enum ReadStatus {
-    Found,
-    Missing,
-    Failure,
-}
-
-#[derive(Serialize)]
-enum WriteStatus {
-    SuccessNew,
-    SuccessOverwrite,
-    Failure,
-}
-
-#[derive(Serialize)]
-struct Response {
-    value: String,
-    status: Status,
-}
-
-impl Response {
-    fn new(value: String, status: Status) -> Self {
-        Self { value, status }
-    }
-
-    fn from_read_error(e: impl Error) -> (StatusCode, Json<Response>) {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json::from(Response::new(
-                e.to_string(),
-                Status::Read(ReadStatus::Failure),
-            )),
-        )
-    }
-
-    fn from_write_error(e: impl Error) -> (StatusCode, Json<Response>) {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json::from(Response::new(
-                e.to_string(),
-                Status::Write(WriteStatus::Failure),
-            )),
-        )
-    }
-}
+use ywkv::{self, Db, Response, YwkvError};
 
 async fn read_key(
     Path(key): Path<String>,
     State(state): State<DbState<'_>>,
 ) -> (StatusCode, Json<Response>) {
-    let db = state.read().await;
+    let state = state.read().await;
 
-    let tx = match db.database.begin_read() {
-        Ok(v) => v,
-        Err(e) => return Response::from_read_error(e),
-    };
-
-    let table = match tx.open_table(db.table) {
-        Ok(v) => v,
-        Err(e) => return Response::from_read_error(e),
-    };
-
-    // Done like this to satisfy the borrow checker
-    let val = table.get(key.as_str());
-    match val {
-        Ok(Some(value)) => (
+    match state.read(key) {
+        Ok(value) => (
             StatusCode::OK,
             Json::from(Response::new(
-                value.value().to_string(),
-                Status::Read(ReadStatus::Found),
+                value,
+                ywkv::Status::Read(ywkv::ReadStatus::Found),
             )),
         ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json::from(Response::new(
-                "".to_string(),
-                Status::Read(ReadStatus::Missing),
-            )),
-        ),
-        Err(e) => Response::from_read_error(e),
+        Err(e) => match e {
+            YwkvError::KeyMissing(_) => (
+                StatusCode::NOT_FOUND,
+                Json::from(Response::new(
+                    e.to_string(),
+                    ywkv::Status::Read(ywkv::ReadStatus::Missing),
+                )),
+            ),
+            YwkvError::EmptyTable(_) => (
+                StatusCode::NOT_FOUND,
+                Json::from(Response::new(
+                    e.to_string(),
+                    ywkv::Status::Read(ywkv::ReadStatus::Missing),
+                )),
+            ),
+            _ => Response::from_read_error(e),
+        },
     }
 }
 
@@ -114,40 +58,25 @@ async fn write_key(
     State(state): State<DbState<'_>>,
     payload: String,
 ) -> (StatusCode, Json<Response>) {
-    let db = state.read().await;
+    let state = state.write().await;
 
-    let tx = match db.database.begin_write() {
-        Ok(v) => v,
-        Err(e) => return Response::from_write_error(e),
-    };
-
-    let resp: Response = {
-        let mut table = match tx.open_table(db.table) {
-            Ok(v) => v,
-            Err(e) => return Response::from_write_error(e),
-        };
-
-        let res = table.insert(key.as_str(), payload.as_str());
-        match res {
-            Ok(Some(v)) => Response::new(
-                v.value().to_string(),
-                Status::Write(WriteStatus::SuccessOverwrite),
-            ),
-            Ok(None) => Response::new("".to_string(), Status::Write(WriteStatus::SuccessNew)),
-            Err(e) => return Response::from_write_error(e),
-        }
-    };
-
-    if let Err(e) = tx.commit() {
-        return Response::from_write_error(e);
+    match state.write(key, payload) {
+        Ok(Some(old_value)) => (
+            StatusCode::CREATED,
+            Json::from(Response::new(
+                old_value,
+                ywkv::Status::Write(ywkv::WriteStatus::SuccessOverwrite),
+            )),
+        ),
+        Ok(None) => (
+            StatusCode::CREATED,
+            Json::from(Response::new(
+                String::new(),
+                ywkv::Status::Write(ywkv::WriteStatus::SuccessNew),
+            )),
+        ),
+        Err(e) => Response::from_read_error(e),
     }
-
-    (StatusCode::OK, Json::from(resp))
-}
-
-struct Db<'a> {
-    database: Database,
-    table: TableDefinition<'a, &'static str, &'static str>,
 }
 
 #[derive(Clone)]
@@ -170,7 +99,7 @@ impl<'a> DbState<'a> {
 }
 
 impl<'a> Deref for DbState<'a> {
-    type Target = Arc<RwLock<Db<'a>>>;
+    type Target = Arc<RwLock<ywkv::Db<'a>>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
