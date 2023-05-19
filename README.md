@@ -13,6 +13,8 @@ Pronounced Yuu-Kiv. A simple key-value server that uses [redb](https://github.co
 ywkv [--port value] [--table-name value] [--db-file-name value] <token>
 ```
 
+All requests should be in format `address/:key`. Value payloads are passed as text.
+
 ### Writing a value
 
 Request:
