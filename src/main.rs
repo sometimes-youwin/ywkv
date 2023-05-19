@@ -20,29 +20,10 @@ use tokio::sync::RwLock;
 use tower_http::{compression::CompressionLayer, validate_request::ValidateRequestHeaderLayer};
 
 #[derive(Serialize)]
-enum WriteStatus {
-    SuccessNew,
-    SuccessOverwrite,
-    Failure,
-}
-
-#[derive(Serialize)]
-struct WriteResponse {
-    value: String,
-    status: WriteStatus,
-}
-
-impl WriteResponse {
-    fn new(value: String, status: WriteStatus) -> Self {
-        Self { value, status }
-    }
-
-    fn from_error(e: impl Error) -> (StatusCode, Json<WriteResponse>) {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json::from(WriteResponse::new(e.to_string(), WriteStatus::Failure)),
-        )
-    }
+#[serde(untagged)]
+enum Status {
+    Read(ReadStatus),
+    Write(WriteStatus),
 }
 
 #[derive(Serialize)]
@@ -53,20 +34,40 @@ enum ReadStatus {
 }
 
 #[derive(Serialize)]
-struct ReadResponse {
-    value: String,
-    status: ReadStatus,
+enum WriteStatus {
+    SuccessNew,
+    SuccessOverwrite,
+    Failure,
 }
 
-impl ReadResponse {
-    fn new(value: String, status: ReadStatus) -> Self {
+#[derive(Serialize)]
+struct Response {
+    value: String,
+    status: Status,
+}
+
+impl Response {
+    fn new(value: String, status: Status) -> Self {
         Self { value, status }
     }
 
-    fn from_error(e: impl Error) -> (StatusCode, Json<ReadResponse>) {
+    fn from_read_error(e: impl Error) -> (StatusCode, Json<Response>) {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json::from(ReadResponse::new(e.to_string(), ReadStatus::Failure)),
+            Json::from(Response::new(
+                e.to_string(),
+                Status::Read(ReadStatus::Failure),
+            )),
+        )
+    }
+
+    fn from_write_error(e: impl Error) -> (StatusCode, Json<Response>) {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json::from(Response::new(
+                e.to_string(),
+                Status::Write(WriteStatus::Failure),
+            )),
         )
     }
 }
@@ -74,17 +75,17 @@ impl ReadResponse {
 async fn read_key(
     Path(key): Path<String>,
     State(state): State<DbState<'_>>,
-) -> (StatusCode, Json<ReadResponse>) {
+) -> (StatusCode, Json<Response>) {
     let db = state.read().await;
 
     let tx = match db.database.begin_read() {
         Ok(v) => v,
-        Err(e) => return ReadResponse::from_error(e),
+        Err(e) => return Response::from_read_error(e),
     };
 
     let table = match tx.open_table(db.table) {
         Ok(v) => v,
-        Err(e) => return ReadResponse::from_error(e),
+        Err(e) => return Response::from_read_error(e),
     };
 
     // Done like this to satisfy the borrow checker
@@ -92,16 +93,19 @@ async fn read_key(
     match val {
         Ok(Some(value)) => (
             StatusCode::OK,
-            Json::from(ReadResponse::new(
+            Json::from(Response::new(
                 value.value().to_string(),
-                ReadStatus::Found,
+                Status::Read(ReadStatus::Found),
             )),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json::from(ReadResponse::new("".to_string(), ReadStatus::Missing)),
+            Json::from(Response::new(
+                "".to_string(),
+                Status::Read(ReadStatus::Missing),
+            )),
         ),
-        Err(e) => ReadResponse::from_error(e),
+        Err(e) => Response::from_read_error(e),
     }
 }
 
@@ -109,30 +113,33 @@ async fn write_key(
     Path(key): Path<String>,
     State(state): State<DbState<'_>>,
     payload: String,
-) -> (StatusCode, Json<WriteResponse>) {
+) -> (StatusCode, Json<Response>) {
     let db = state.read().await;
 
     let tx = match db.database.begin_write() {
         Ok(v) => v,
-        Err(e) => return WriteResponse::from_error(e),
+        Err(e) => return Response::from_write_error(e),
     };
 
-    let resp: WriteResponse = {
+    let resp: Response = {
         let mut table = match tx.open_table(db.table) {
             Ok(v) => v,
-            Err(e) => return WriteResponse::from_error(e),
+            Err(e) => return Response::from_write_error(e),
         };
 
         let res = table.insert(key.as_str(), payload.as_str());
         match res {
-            Ok(Some(v)) => WriteResponse::new(v.value().to_string(), WriteStatus::SuccessOverwrite),
-            Ok(None) => WriteResponse::new("".to_string(), WriteStatus::SuccessNew),
-            Err(e) => return WriteResponse::from_error(e),
+            Ok(Some(v)) => Response::new(
+                v.value().to_string(),
+                Status::Write(WriteStatus::SuccessOverwrite),
+            ),
+            Ok(None) => Response::new("".to_string(), Status::Write(WriteStatus::SuccessNew)),
+            Err(e) => return Response::from_write_error(e),
         }
     };
 
     if let Err(e) = tx.commit() {
-        return WriteResponse::from_error(e);
+        return Response::from_write_error(e);
     }
 
     (StatusCode::OK, Json::from(resp))
@@ -178,35 +185,40 @@ impl<'a> DerefMut for DbState<'a> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    const TABLE_NAME: &str = "table-name";
+    const PORT: &str = "port";
+    const DB_FILE_NAME: &str = "db-file-name";
+    const TOKEN: &str = "token";
+
     let args = clap::Command::new("ywkv")
         .arg(
-            Arg::new("table-name")
-                .long("table-name")
+            Arg::new(TABLE_NAME)
+                .long(TABLE_NAME)
                 .required(false)
                 .default_value("main")
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("port")
-                .long("port")
+            Arg::new(PORT)
+                .long(PORT)
                 .required(false)
                 .default_value("9958")
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("db-file-name")
-                .long("db-file-name")
+            Arg::new(DB_FILE_NAME)
+                .long(DB_FILE_NAME)
                 .required(false)
                 .default_value("ywkv.redb")
                 .action(ArgAction::Set),
         )
-        .arg(Arg::new("token").required(true).action(ArgAction::Set))
+        .arg(Arg::new(TOKEN).required(true).action(ArgAction::Set))
         .get_matches();
 
-    let table_name = args.get_one::<String>("table-name").unwrap();
-    let port = args.get_one::<String>("port").unwrap();
-    let db_file_name = args.get_one::<String>("db-file-name").unwrap();
-    let token = args.get_one::<String>("token").unwrap();
+    let table_name = args.get_one::<String>(TABLE_NAME).unwrap();
+    let port = args.get_one::<String>(PORT).unwrap();
+    let db_file_name = args.get_one::<String>(DB_FILE_NAME).unwrap();
+    let token = args.get_one::<String>(TOKEN).unwrap();
 
     // Intentionally leaking the String here in order to create a static TableDefinition at runtime
     let state = DbState::new(db_file_name, Box::leak(table_name.clone().into_boxed_str()))?;
